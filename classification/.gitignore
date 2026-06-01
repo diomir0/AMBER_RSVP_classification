@@ -1,0 +1,31 @@
+# AMBER ERP Classification - Git Ignore
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Data files (large)
+data_for_classification/*.npz
+data_for_classification/*.mat
+
+# Results (generated)
+results/**/*.pkl
+results/**/*.png
+results/**/*.csv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Conda
+.conda/

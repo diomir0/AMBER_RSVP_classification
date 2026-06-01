@@ -1,0 +1,5 @@
+Dataset/
+classification/data_for_classification/
+classification/__pycache__/
+preprocessing/clean
+preprocessing/*.mat
