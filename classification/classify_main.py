@@ -32,6 +32,7 @@ from config import (
     DENOISING_METHODS,
     MA_WIN,
     N_FOLDS,
+    N_JOBS,
     RANDOM_STATE,
     RESULTS_ROOT,
     TIME_SWITCH,
@@ -63,13 +64,12 @@ def build_classifiers(n_classes: int) -> dict:
             eval_metric="auc",
             max_depth=4,
             n_estimators=100,
-            use_label_encoder=False,
         ),
         "RF": RandomForestClassifier(
             n_estimators=100, max_depth=4, class_weight="balanced"
         ),
-        "SVC_lin": SVC(kernel="linear", probability=True, gamma="scale", max_iter=2000),
-        "SVC_rbf": SVC(kernel="rbf", probability=True, gamma="scale", max_iter=2000),
+        "SVC_lin": SVC(kernel="linear", probability=True, gamma="scale", max_iter=4000),
+        "SVC_rbf": SVC(kernel="rbf", probability=True, gamma="scale", max_iter=4000),
     }
 
 
@@ -140,6 +140,15 @@ def main():
         help=(
             "Task-set identifier (e.g. 'all', 'standard', 'artifact', 'artifact_X4X6'). "
             "Determines which .npz feature file to load. Default: 'all'."
+        ),
+    )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=N_JOBS,
+        help=(
+            "Number of parallel jobs for classification "
+            "(-1 = all CPUs, 1 = sequential). Default: from config."
         ),
     )
     args = parser.parse_args()
@@ -279,6 +288,7 @@ def main():
                 balancing,
                 MA_WIN,
                 time_switch,
+                n_jobs=args.n_jobs,
             )
             extra = subject_ids
         elif classification_type.startswith(
@@ -294,6 +304,7 @@ def main():
                 labels,
                 balancing,
                 time_switch,
+                n_jobs=args.n_jobs,
             )
             extra = []
         else:

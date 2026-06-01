@@ -49,6 +49,7 @@ import warnings
 
 import mne
 import numpy as np
+from joblib import Parallel, delayed
 from scipy.signal import stft
 
 # Local config
@@ -63,6 +64,7 @@ from config import (
     ERP_PARAMS,
     N_EPOCHS_EXPECTED,
     N_FREQ_EXPECTED,
+    N_JOBS,
     N_RARE_EXPECTED,
     N_TRIALS_MAX,
     N_TRIALS_THRESHOLD,
@@ -421,12 +423,99 @@ def extract_temporal_features(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Per-file processing (standalone for parallel dispatch)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _process_single_file(file_info, feature_type, cluster_channels, noise_threshold_uv):
+    """Process a single .set file: load, reject trials, extract features.
+
+    Standalone function designed for use with joblib parallel processing.
+    Returns a dict with extracted data, or None if the file could not be
+    processed.
+    """
+    try:
+        epochs, labels, task = load_and_epoch(file_info)
+    except Exception as e:
+        print(f"  [SKIP] Error loading {file_info['path']}: {e}")
+        return None
+
+    if epochs is None:
+        return None
+
+    # Get channel names from epochs info
+    ch_names = epochs.info["ch_names"]
+    # Build cluster_channels with actual channel name resolution
+    cluster_ch_by_name = {}
+    for cluster_name, indices in cluster_channels.items():
+        chs = []
+        for idx in indices:
+            if idx - 1 < len(ch_names):
+                chs.append(ch_names[idx - 1])
+        cluster_ch_by_name[cluster_name] = chs
+
+    # Reject bad trials
+    data_clean, labels_clean = reject_trials(
+        epochs, labels, cluster_ch_by_name, noise_threshold_uv
+    )
+    if data_clean is None:
+        return None
+
+    n_trials = data_clean.shape[0]
+    n_rare = int(np.sum(labels_clean == 1))
+    n_freq = int(np.sum(labels_clean == 0))
+    print(
+        f"    Subject {file_info['subject']}, Session {file_info['session']}, "
+        f"Task {task}: {n_trials} good trials ({n_rare} rare, {n_freq} frequent)"
+    )
+
+    times = epochs.times
+    sfreq = epochs.info["sfreq"]
+
+    # Determine task type label (0=standard RSVP, 1=artifact RSVP)
+    task_label = 1 if task in ARTIFACT_RSVP else 0
+    sub_id = file_info["subject"]
+
+    result = {
+        "IDs": [[sub_id, task_label]] * n_trials,
+        "y_stim": labels_clean.tolist(),
+        "y_task": [task_label] * n_trials,
+        "subject_ids": [sub_id] * n_trials,
+        "sub_id": sub_id,
+        "task": task,
+        "task_label": task_label,
+        "n_trials": n_trials,
+        "times": times,
+        "sfreq": sfreq,
+    }
+
+    if feature_type in ("stat", "both"):
+        X_stat, feat_names_stat = extract_stat_params(
+            data_clean, times, sfreq, cluster_channels
+        )
+        result["X_stat"] = X_stat
+        result["feat_names_stat"] = feat_names_stat
+
+    if feature_type in ("temporal", "both"):
+        X_temp, feat_names_temp = extract_temporal_features(
+            data_clean, times, sfreq, cluster_channels
+        )
+        result["X_temp"] = X_temp
+        result["feat_names_temp"] = feat_names_temp
+
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Main extraction loop
 # ──────────────────────────────────────────────────────────────────────
 
 
 def extract_features_for_method(
-    method: str, feature_type: str = "both", tasks: list[str] | None = None
+    method: str,
+    feature_type: str = "both",
+    tasks: list[str] | None = None,
+    n_jobs: int = N_JOBS,
 ):
     """Run feature extraction for a single denoising method.
 
@@ -438,6 +527,8 @@ def extract_features_for_method(
         "stat", "temporal", or "both".
     tasks : list[str] or None
         Which RSVP tasks to include. None = all RSVP tasks.
+    n_jobs : int
+        Number of parallel jobs. -1 = all CPUs, 1 = sequential.
     """
     if tasks is None:
         tasks = STANDARD_RSVP + ARTIFACT_RSVP
@@ -461,88 +552,55 @@ def extract_features_for_method(
     # Build channel cluster mapping from config (1-based indices)
     cluster_channels = ELEC_CLUSTS  # dict: name -> list of 1-based indices
 
-    # Collect data across all subjects
-    all_data = {
-        "stat": {"X": [], "IDs": [], "y_stim": [], "y_task": [], "subject_ids": []},
-        "temporal": {"X": [], "IDs": [], "y_stim": [], "y_task": [], "subject_ids": []},
-    }
-
-    sub_counter = 0
-    for file_info in file_list:
-        print(f"  Processing {os.path.basename(file_info['path'])} ...")
-
-        try:
-            epochs, labels, task = load_and_epoch(file_info)
-        except Exception as e:
-            print(f"  [SKIP] Error loading {file_info['path']}: {e}")
-            continue
-
-        if epochs is None:
-            continue
-
-        # Get channel names from epochs info
-        ch_names = epochs.info["ch_names"]
-        # Build cluster_channels with actual channel name resolution
-        cluster_ch_by_name = {}
-        for cluster_name, indices in cluster_channels.items():
-            chs = []
-            for idx in indices:
-                if idx - 1 < len(ch_names):
-                    chs.append(ch_names[idx - 1])
-            cluster_ch_by_name[cluster_name] = chs
-
-        # Reject bad trials
-        data_clean, labels_clean = reject_trials(
-            epochs, labels, cluster_ch_by_name, NOISE_THRESHOLD_UV
-        )
-        if data_clean is None:
-            continue
-
-        n_trials = data_clean.shape[0]
-        n_rare = int(np.sum(labels_clean == 1))
-        n_freq = int(np.sum(labels_clean == 0))
+    # Process files (parallel or sequential)
+    effective_n_jobs = n_jobs if n_jobs != 1 and len(file_list) > 1 else 1
+    if effective_n_jobs != 1:
         print(
-            f"    Subject {file_info['subject']}, Session {file_info['session']}, "
-            f"Task {task}: {n_trials} good trials ({n_rare} rare, {n_freq} frequent)"
+            f"  Processing {len(file_list)} files in parallel (n_jobs={effective_n_jobs})"
         )
-
-        times = epochs.times
-        sfreq = epochs.info["sfreq"]
-
-        # Determine task type label (0=standard RSVP, 1=artifact RSVP)
-        task_label = 1 if task in ARTIFACT_RSVP else 0
-
-        # Subject ID (1-based, unique per subject across sessions)
-        sub_id = file_info["subject"]
-
-        # Extract features
-        if feature_type in ("stat", "both"):
-            X_stat, feat_names_stat = extract_stat_params(
-                data_clean, times, sfreq, cluster_channels
+        results = Parallel(n_jobs=effective_n_jobs, verbose=10)(
+            delayed(_process_single_file)(
+                fi, feature_type, cluster_channels, NOISE_THRESHOLD_UV
             )
-            all_data["stat"]["X"].append(X_stat)
-            all_data["stat"]["IDs"].extend([[sub_id, task_label]] * n_trials)
-            all_data["stat"]["y_stim"].extend(labels_clean.tolist())
-            all_data["stat"]["y_task"].extend([task_label] * n_trials)
-            all_data["stat"]["subject_ids"].extend([sub_id] * n_trials)
+            for fi in file_list
+        )
+    else:
+        results = [
+            _process_single_file(fi, feature_type, cluster_channels, NOISE_THRESHOLD_UV)
+            for fi in file_list
+        ]
 
-        if feature_type in ("temporal", "both"):
-            X_temp, feat_names_temp = extract_temporal_features(
-                data_clean, times, sfreq, cluster_channels
-            )
-            all_data["temporal"]["X"].append(X_temp)
-            all_data["temporal"]["IDs"].extend([[sub_id, task_label]] * n_trials)
-            all_data["temporal"]["y_stim"].extend(labels_clean.tolist())
-            all_data["temporal"]["y_task"].extend([task_label] * n_trials)
-            all_data["temporal"]["subject_ids"].extend([sub_id] * n_trials)
-
-        sub_counter += 1
+    # Filter out None results
+    results = [r for r in results if r is not None]
+    sub_counter = len(results)
 
     if sub_counter == 0:
         print(f"[WARN] No subjects were successfully processed for method={method}")
         return
 
     print(f"  Successfully processed {sub_counter} files")
+
+    # Collect data across all subjects from results
+    all_data = {
+        "stat": {"X": [], "IDs": [], "y_stim": [], "y_task": [], "subject_ids": []},
+        "temporal": {"X": [], "IDs": [], "y_stim": [], "y_task": [], "subject_ids": []},
+    }
+
+    for result in results:
+        for ftype in ["stat", "temporal"]:
+            X_key = f"X_{ftype}"
+            if X_key in result:
+                all_data[ftype]["X"].append(result[X_key])
+                all_data[ftype]["IDs"].extend(result["IDs"])
+                all_data[ftype]["y_stim"].extend(result["y_stim"])
+                all_data[ftype]["y_task"].extend(result["y_task"])
+                all_data[ftype]["subject_ids"].extend(result["subject_ids"])
+
+    # Get feature names and metadata from last successful result
+    feat_names_stat = results[-1].get("feat_names_stat")
+    feat_names_temp = results[-1].get("feat_names_temp")
+    times = results[-1].get("times")
+    sfreq = results[-1].get("sfreq")
 
     # Save outputs
     os.makedirs(DATA_OUT_ROOT, exist_ok=True)
@@ -631,6 +689,15 @@ def main():
         help="When 'artifact' is in --recordings, which conditions to include: "
         "X4, X6, X8, or any subset. Default: all (X4 X6 X8).",
     )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=N_JOBS,
+        help=(
+            "Number of parallel jobs for feature extraction "
+            "(-1 = all CPUs, 1 = sequential). Default: from config."
+        ),
+    )
     args = parser.parse_args()
 
     # Resolve recordings to task list
@@ -653,7 +720,9 @@ def main():
         methods = [args.method]
 
     for method in methods:
-        extract_features_for_method(method, feature_type=args.feature_type, tasks=tasks)
+        extract_features_for_method(
+            method, feature_type=args.feature_type, tasks=tasks, n_jobs=args.n_jobs
+        )
 
     print("\n=== Feature extraction complete ===")
 

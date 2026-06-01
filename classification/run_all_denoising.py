@@ -25,6 +25,7 @@ from config import (
     BALANCING,
     DENOISING_METHODS,
     MA_WIN,
+    N_JOBS,
     TIME_SWITCH,
     get_task_id,
     resolve_recordings,
@@ -100,6 +101,15 @@ def main():
             "Any subset of: X4, X6, X8. Default: all three."
         ),
     )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=N_JOBS,
+        help=(
+            "Number of parallel jobs for feature extraction and classification "
+            "(-1 = all CPUs, 1 = sequential). Default: from config."
+        ),
+    )
     args = parser.parse_args()
 
     # Resolve recordings to task list and task_id
@@ -114,6 +124,7 @@ def main():
     # Build task arguments for subprocess calls
     tasks_args = ["--tasks"] + tasks
     task_set_args = ["--task-set", task_id]
+    n_jobs_args = ["--n-jobs", str(args.n_jobs)]
 
     # Step 1: Feature extraction
     if not args.skip_extract:
@@ -129,7 +140,8 @@ def main():
                     "--feature-type",
                     args.feature_type,
                 ]
-                + tasks_args,
+                + tasks_args
+                + n_jobs_args,
                 f"Feature extraction - {method} (tasks: {task_id})",
             )
 
@@ -149,7 +161,8 @@ def main():
                     "--time-switch",
                     TIME_SWITCH,
                 ]
-                + task_set_args,
+                + task_set_args
+                + n_jobs_args,
                 f"Classification - {method} (tasks: {task_id})",
             )
 

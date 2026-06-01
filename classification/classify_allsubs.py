@@ -10,6 +10,7 @@ from collections import Counter
 import numpy as np
 from imblearn.over_sampling import SMOTE, RandomOverSampler
 from imblearn.under_sampling import RandomUnderSampler
+from joblib import Parallel, delayed
 from sklearn.feature_selection import mutual_info_classif
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
@@ -26,6 +27,226 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import MinMaxScaler
 
 
+def _classify_allsubs_timepoint(
+    itime,
+    data,
+    classifier,
+    classifier_name,
+    nFeatures,
+    nClasses,
+    labels,
+    balancing,
+    time_switch,
+):
+    """Classify one time point for all-subjects classification.
+
+    Standalone function designed for use with joblib parallel processing.
+
+    Parameters
+    ----------
+    itime : int
+        Time-point index.
+    data : np.ndarray
+        Feature data. Shape (nTrials, nFeatures) for notime, or
+        (nTrials, nFeatures, nSamples) for temporal features.
+    classifier : sklearn classifier object (unfitted copy)
+    classifier_name : str
+    nFeatures : int
+    nClasses : int
+    labels : np.ndarray, shape (nTrials,)
+    balancing : str, "smote" | "ros" | "none"
+    time_switch : str, "" or "_notime"
+
+    Returns
+    -------
+    dict with metric values for this time point.
+    """
+    print(f"  {classifier_name} | allsubs | time {itime}")
+
+    X = data if "notime" in time_switch else np.squeeze(data[:, :, itime])
+    y = np.copy(labels)
+
+    nFolds = 10
+    kfold = StratifiedKFold(n_splits=nFolds, shuffle=True, random_state=1)
+
+    probs_kfold = np.zeros(nClasses)
+    acc_std_list = []
+    accbal_std_list = []
+    auc_std_list = []
+    acc_kfold = 0.0
+    accbal_kfold = 0.0
+    auc_kfold = 0.0
+    recall_kfold = 0.0
+    precision_kfold = 0.0
+    f1_kfold = 0.0
+    importance_acc_mean_kfold = np.zeros(nFeatures)
+    importance_acc_std_kfold = np.zeros(nFeatures)
+    importance_auc_mean_kfold = np.zeros(nFeatures)
+    importance_auc_std_kfold = np.zeros(nFeatures)
+    importance_accbal_mean_kfold = np.zeros(nFeatures)
+    importance_accbal_std_kfold = np.zeros(nFeatures)
+    importance_mi_scores_kfold = np.zeros(nFeatures)
+
+    for train_ix, test_ix in kfold.split(X, y):
+        X_train_orig, X_test_orig = X[train_ix], X[test_ix]
+        y_train_orig, y_test_orig = y[train_ix], y[test_ix]
+
+        # Impute NaN values
+        imputer = SimpleImputer(strategy="median").fit(X_train_orig)
+        X_train_orig = imputer.transform(X_train_orig)
+        X_test_orig = imputer.transform(X_test_orig)
+
+        # Balance classes
+        class_counts = Counter(y_train_orig)
+        classes_present = sorted(class_counts.keys())
+        meanSamples = int(np.mean([class_counts.get(c, 0) for c in classes_present]))
+        if meanSamples == 0:
+            continue
+
+        if len(classes_present) == 2:
+            undersample_key = classes_present[0]
+            oversample_key = classes_present[1]
+            try:
+                rus = RandomUnderSampler(
+                    sampling_strategy={undersample_key: meanSamples}, random_state=0
+                )
+                X_train_temp, y_train_temp = rus.fit_resample(
+                    X_train_orig, y_train_orig
+                )
+            except ValueError:
+                X_train_temp, y_train_temp = X_train_orig, y_train_orig
+        else:
+            # Multi-class: undersample majority, oversample minority
+            oversample_strategy = {c: meanSamples for c in classes_present}
+            X_train_temp, y_train_temp = X_train_orig, y_train_orig
+
+        if balancing == "smote":
+            try:
+                overSmote = SMOTE(
+                    sampling_strategy={c: meanSamples for c in classes_present},
+                    random_state=0,
+                )
+                X_train, y_train = overSmote.fit_resample(X_train_temp, y_train_temp)
+            except (ValueError, RuntimeError):
+                X_train, y_train = X_train_temp, y_train_temp
+        elif balancing == "ros":
+            try:
+                ros = RandomOverSampler(
+                    sampling_strategy={c: meanSamples for c in classes_present},
+                    random_state=0,
+                )
+                X_train, y_train = ros.fit_resample(X_train_temp, y_train_temp)
+            except ValueError:
+                X_train, y_train = X_train_temp, y_train_temp
+        else:
+            X_train, y_train = X_train_orig, y_train_orig
+
+        # Shuffle after balancing
+        rng = np.random.default_rng()
+        shuffle_indices = np.arange(len(y_train))
+        rng.shuffle(shuffle_indices)
+        X_train = X_train[shuffle_indices, :]
+        y_train = y_train[shuffle_indices]
+
+        # Normalize
+        scaler = MinMaxScaler().fit(X_train)
+        X_train_norm = scaler.transform(X_train)
+        X_test_norm = scaler.transform(X_test_orig)
+
+        # Train
+        classifier.fit(X_train_norm, y_train)
+
+        # Predict
+        y_pred = classifier.predict(X_test_norm)
+        y_pred_prob = classifier.predict_proba(X_test_norm)
+
+        # Evaluate
+        probs_kfold += np.mean(y_pred_prob, axis=0)
+        acc_kfold += accuracy_score(y_test_orig, y_pred)
+        acc_std_list.append(accuracy_score(y_test_orig, y_pred))
+        accbal_kfold += balanced_accuracy_score(y_test_orig, y_pred)
+        accbal_std_list.append(balanced_accuracy_score(y_test_orig, y_pred))
+
+        try:
+            if nClasses == 2:
+                auc_kfold += roc_auc_score(y_test_orig, y_pred)
+            else:
+                auc_kfold += roc_auc_score(
+                    y_test_orig, y_pred_prob, average="weighted", multi_class="ovr"
+                )
+            auc_std_list.append(
+                roc_auc_score(y_test_orig, y_pred)
+                if nClasses == 2
+                else roc_auc_score(
+                    y_test_orig, y_pred_prob, average="weighted", multi_class="ovr"
+                )
+            )
+        except ValueError:
+            pass
+
+        precision_kfold += precision_score(
+            y_test_orig, y_pred, average="weighted", zero_division=0
+        )
+        recall_kfold += recall_score(
+            y_test_orig, y_pred, average="weighted", zero_division=0
+        )
+        f1_kfold += f1_score(y_test_orig, y_pred, average="weighted", zero_division=0)
+
+        # Feature importance
+        try:
+            importance_mi_scores_kfold += mutual_info_classif(X_train_norm, y_train)
+        except Exception:
+            pass
+
+        try:
+            imp_acc = permutation_importance(
+                classifier, X_train_norm, y_train, scoring="accuracy"
+            )
+            importance_acc_mean_kfold += imp_acc.importances_mean
+            importance_acc_std_kfold += imp_acc.importances_std
+        except Exception:
+            pass
+
+        try:
+            imp_accbal = permutation_importance(
+                classifier, X_train_norm, y_train, scoring="balanced_accuracy"
+            )
+            importance_accbal_mean_kfold += imp_accbal.importances_mean
+            importance_accbal_std_kfold += imp_accbal.importances_std
+        except Exception:
+            pass
+
+        try:
+            scoring = "roc_auc" if nClasses == 2 else "roc_auc_ovr"
+            imp_auc = permutation_importance(
+                classifier, X_train_norm, y_train, scoring=scoring
+            )
+            importance_auc_mean_kfold += imp_auc.importances_mean
+            importance_auc_std_kfold += imp_auc.importances_std
+        except Exception:
+            pass
+
+    return {
+        "probs": probs_kfold / nFolds,
+        "acc": acc_kfold / nFolds,
+        "acc_std": np.std(acc_std_list) if acc_std_list else 0.0,
+        "accbal": accbal_kfold / nFolds,
+        "accbal_std": np.std(accbal_std_list) if accbal_std_list else 0.0,
+        "auc": auc_kfold / nFolds,
+        "auc_std": np.std(auc_std_list) if auc_std_list else 0.0,
+        "recall": recall_kfold / nFolds,
+        "precision": precision_kfold / nFolds,
+        "f1": f1_kfold / nFolds,
+        "importance_acc_mean": importance_acc_mean_kfold / nFolds,
+        "importance_acc_std": importance_acc_std_kfold / nFolds,
+        "importance_accbal_mean": importance_accbal_mean_kfold / nFolds,
+        "importance_accbal_std": importance_accbal_std_kfold / nFolds,
+        "importance_auc_mean": importance_auc_mean_kfold / nFolds,
+        "importance_auc_std": importance_auc_std_kfold / nFolds,
+        "importance_mi": importance_mi_scores_kfold / nFolds,
+    }
+
+
 def classify_allsubs(
     data,
     classifier,
@@ -36,6 +257,7 @@ def classify_allsubs(
     labels,
     balancing,
     time_switch,
+    n_jobs=1,
 ):
     """Classify rare vs frequent across all subjects using 10-fold stratified CV.
 
@@ -53,11 +275,14 @@ def classify_allsubs(
         Class labels.
     balancing : str, "smote" | "ros" | "none"
     time_switch : str, "" or "_notime"
+    n_jobs : int
+        Number of parallel jobs (-1 = all CPUs, 1 = sequential).
 
     Returns
     -------
     results : dict with metric arrays
     """
+    # Initialize metric arrays
     probs_total = np.empty((nClasses, nSamples))
     acc_total = np.empty(nSamples)
     acc_std_total = np.empty(nSamples)
@@ -76,196 +301,63 @@ def classify_allsubs(
     importance_auc_std_total = np.empty((nFeatures, nSamples))
     importance_mi_total = np.empty((nFeatures, nSamples))
 
-    for itime in range(nSamples):
-        print(f"  {classifier_name} | allsubs | time {itime}/{nSamples - 1}")
+    # Process time points in parallel or sequentially
+    effective_n_jobs = n_jobs if n_jobs != 1 and nSamples > 1 else 1
 
-        probs_kfold = np.zeros(nClasses)
-        acc_kfold = 0.0
-        acc_std_kfold = []
-        accbal_kfold = 0.0
-        accbal_std_kfold = []
-        auc_kfold = 0.0
-        auc_std_kfold = []
-        recall_kfold = 0.0
-        precision_kfold = 0.0
-        f1_kfold = 0.0
-        importance_acc_mean_kfold = np.zeros(nFeatures)
-        importance_acc_std_kfold = np.zeros(nFeatures)
-        importance_auc_mean_kfold = np.zeros(nFeatures)
-        importance_auc_std_kfold = np.zeros(nFeatures)
-        importance_accbal_mean_kfold = np.zeros(nFeatures)
-        importance_accbal_std_kfold = np.zeros(nFeatures)
-        importance_mi_scores_kfold = np.zeros(nFeatures)
-
-        X = data if "notime" in time_switch else np.squeeze(data[:, :, itime])
-        y = np.copy(labels)
-
-        nFolds = 10
-        kfold = StratifiedKFold(n_splits=nFolds, shuffle=True, random_state=1)
-
-        for train_ix, test_ix in kfold.split(X, y):
-            X_train_orig, X_test_orig = X[train_ix], X[test_ix]
-            y_train_orig, y_test_orig = y[train_ix], y[test_ix]
-
-            # Impute NaN values
-            imputer = SimpleImputer(strategy="median").fit(X_train_orig)
-            X_train_orig = imputer.transform(X_train_orig)
-            X_test_orig = imputer.transform(X_test_orig)
-
-            # Balance classes
-            class_counts = Counter(y_train_orig)
-            classes_present = sorted(class_counts.keys())
-            meanSamples = int(
-                np.mean([class_counts.get(c, 0) for c in classes_present])
+    if effective_n_jobs != 1:
+        print(
+            f"  {classifier_name} | allsubs | processing {nSamples} time points "
+            f"in parallel (n_jobs={effective_n_jobs})"
+        )
+        tp_results = Parallel(n_jobs=effective_n_jobs, verbose=10)(
+            delayed(_classify_allsubs_timepoint)(
+                itime,
+                data,
+                classifier,
+                classifier_name,
+                nFeatures,
+                nClasses,
+                labels,
+                balancing,
+                time_switch,
             )
-            if meanSamples == 0:
-                continue
-
-            if len(classes_present) == 2:
-                undersample_key = classes_present[0]
-                oversample_key = classes_present[1]
-                try:
-                    rus = RandomUnderSampler(
-                        sampling_strategy={undersample_key: meanSamples}, random_state=0
-                    )
-                    X_train_temp, y_train_temp = rus.fit_resample(
-                        X_train_orig, y_train_orig
-                    )
-                except ValueError:
-                    X_train_temp, y_train_temp = X_train_orig, y_train_orig
-            else:
-                # Multi-class: undersample majority, oversample minority
-                oversample_strategy = {c: meanSamples for c in classes_present}
-                X_train_temp, y_train_temp = X_train_orig, y_train_orig
-
-            if balancing == "smote":
-                try:
-                    overSmote = SMOTE(
-                        sampling_strategy={c: meanSamples for c in classes_present},
-                        random_state=0,
-                    )
-                    X_train, y_train = overSmote.fit_resample(
-                        X_train_temp, y_train_temp
-                    )
-                except (ValueError, RuntimeError):
-                    X_train, y_train = X_train_temp, y_train_temp
-            elif balancing == "ros":
-                try:
-                    ros = RandomOverSampler(
-                        sampling_strategy={c: meanSamples for c in classes_present},
-                        random_state=0,
-                    )
-                    X_train, y_train = ros.fit_resample(X_train_temp, y_train_temp)
-                except ValueError:
-                    X_train, y_train = X_train_temp, y_train_temp
-            else:
-                X_train, y_train = X_train_orig, y_train_orig
-
-            # Shuffle after balancing
-            rng = np.random.default_rng()
-            shuffle_indices = np.arange(len(y_train))
-            rng.shuffle(shuffle_indices)
-            X_train = X_train[shuffle_indices, :]
-            y_train = y_train[shuffle_indices]
-
-            # Normalize
-            scaler = MinMaxScaler().fit(X_train)
-            X_train_norm = scaler.transform(X_train)
-            X_test_norm = scaler.transform(X_test_orig)
-
-            # Train
-            classifier.fit(X_train_norm, y_train)
-
-            # Predict
-            y_pred = classifier.predict(X_test_norm)
-            y_pred_prob = classifier.predict_proba(X_test_norm)
-
-            # Evaluate
-            probs_kfold += np.mean(y_pred_prob, axis=0)
-            acc_kfold += accuracy_score(y_test_orig, y_pred)
-            acc_std_kfold.append(accuracy_score(y_test_orig, y_pred))
-            accbal_kfold += balanced_accuracy_score(y_test_orig, y_pred)
-            accbal_std_kfold.append(balanced_accuracy_score(y_test_orig, y_pred))
-
-            try:
-                if nClasses == 2:
-                    auc_kfold += roc_auc_score(y_test_orig, y_pred)
-                else:
-                    auc_kfold += roc_auc_score(
-                        y_test_orig, y_pred_prob, average="weighted", multi_class="ovr"
-                    )
-                auc_std_kfold.append(
-                    roc_auc_score(y_test_orig, y_pred)
-                    if nClasses == 2
-                    else roc_auc_score(
-                        y_test_orig, y_pred_prob, average="weighted", multi_class="ovr"
-                    )
-                )
-            except ValueError:
-                pass
-
-            precision_kfold += precision_score(
-                y_test_orig, y_pred, average="weighted", zero_division=0
+            for itime in range(nSamples)
+        )
+    else:
+        tp_results = [
+            _classify_allsubs_timepoint(
+                itime,
+                data,
+                classifier,
+                classifier_name,
+                nFeatures,
+                nClasses,
+                labels,
+                balancing,
+                time_switch,
             )
-            recall_kfold += recall_score(
-                y_test_orig, y_pred, average="weighted", zero_division=0
-            )
-            f1_kfold += f1_score(
-                y_test_orig, y_pred, average="weighted", zero_division=0
-            )
+            for itime in range(nSamples)
+        ]
 
-            # Feature importance
-            try:
-                importance_mi_scores_kfold += mutual_info_classif(X_train_norm, y_train)
-            except Exception:
-                pass
-
-            try:
-                imp_acc = permutation_importance(
-                    classifier, X_train_norm, y_train, scoring="accuracy"
-                )
-                importance_acc_mean_kfold += imp_acc.importances_mean
-                importance_acc_std_kfold += imp_acc.importances_std
-            except Exception:
-                pass
-
-            try:
-                imp_accbal = permutation_importance(
-                    classifier, X_train_norm, y_train, scoring="balanced_accuracy"
-                )
-                importance_accbal_mean_kfold += imp_accbal.importances_mean
-                importance_accbal_std_kfold += imp_accbal.importances_std
-            except Exception:
-                pass
-
-            try:
-                scoring = "roc_auc" if nClasses == 2 else "roc_auc_ovr"
-                imp_auc = permutation_importance(
-                    classifier, X_train_norm, y_train, scoring=scoring
-                )
-                importance_auc_mean_kfold += imp_auc.importances_mean
-                importance_auc_std_kfold += imp_auc.importances_std
-            except Exception:
-                pass
-
-        # Save averages
-        probs_total[:, itime] = probs_kfold / nFolds
-        acc_total[itime] = acc_kfold / nFolds
-        acc_std_total[itime] = np.std(acc_std_kfold)
-        accbal_total[itime] = accbal_kfold / nFolds
-        accbal_std_total[itime] = np.std(accbal_std_kfold)
-        auc_total[itime] = auc_kfold / nFolds
-        auc_std_total[itime] = np.std(auc_std_kfold)
-        recall_total[itime] = recall_kfold / nFolds
-        precision_total[itime] = precision_kfold / nFolds
-        f1_total[itime] = f1_kfold / nFolds
-        importance_acc_total[:, itime] = importance_acc_mean_kfold / nFolds
-        importance_acc_std_total[:, itime] = importance_acc_std_kfold / nFolds
-        importance_accbal_total[:, itime] = importance_accbal_mean_kfold / nFolds
-        importance_accbal_std_total[:, itime] = importance_accbal_std_kfold / nFolds
-        importance_auc_total[:, itime] = importance_auc_mean_kfold / nFolds
-        importance_auc_std_total[:, itime] = importance_auc_std_kfold / nFolds
-        importance_mi_total[:, itime] = importance_mi_scores_kfold / nFolds
+    # Collect results
+    for itime, r in enumerate(tp_results):
+        probs_total[:, itime] = r["probs"]
+        acc_total[itime] = r["acc"]
+        acc_std_total[itime] = r["acc_std"]
+        accbal_total[itime] = r["accbal"]
+        accbal_std_total[itime] = r["accbal_std"]
+        auc_total[itime] = r["auc"]
+        auc_std_total[itime] = r["auc_std"]
+        recall_total[itime] = r["recall"]
+        precision_total[itime] = r["precision"]
+        f1_total[itime] = r["f1"]
+        importance_acc_total[:, itime] = r["importance_acc_mean"]
+        importance_acc_std_total[:, itime] = r["importance_acc_std"]
+        importance_accbal_total[:, itime] = r["importance_accbal_mean"]
+        importance_accbal_std_total[:, itime] = r["importance_accbal_std"]
+        importance_auc_total[:, itime] = r["importance_auc_mean"]
+        importance_auc_std_total[:, itime] = r["importance_auc_std"]
+        importance_mi_total[:, itime] = r["importance_mi"]
 
     results = {
         "probs_total": probs_total,
