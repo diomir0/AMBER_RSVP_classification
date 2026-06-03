@@ -626,7 +626,7 @@ def extract_features_for_method(
         else:
             feat_names = feat_names_temp
 
-        data_version = get_data_version(method, task_id) + time_suffix
+        data_version = get_data_version(method, task_id)
         filename = f"data_{data_version}.npz"
         filepath = os.path.join(DATA_OUT_ROOT, filename)
 

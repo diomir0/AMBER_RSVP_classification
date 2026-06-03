@@ -13,6 +13,7 @@ import argparse
 import os
 import pickle
 import sys
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -36,12 +37,12 @@ from config import (
 
 def merge_results(
     method: str,
-    classification_type: str = None,
+    classification_type: Optional[str] = None,
     balancing: str = BALANCING,
     ma_win: int = MA_WIN,
     time_switch: str = TIME_SWITCH,
     task_set: str = "all",
-):
+) -> None:
     """Merge individual classifier results into DataFrames."""
     if classification_type is None:
         classification_type = "bysub" + time_switch
@@ -84,6 +85,9 @@ def merge_results(
     label_names = general_info["label_names"]
     times = general_info["times"] if time_switch == "" else np.array([0])
     subID = general_info["subID"]
+    # Precompute unique subject IDs and counts
+    unique_subIDs = np.unique(subID)
+    nSubs_unique = len(unique_subIDs)
     nSamples = len(times) if time_switch != "_notime" else 1
     nFeatures = len(feature_names)
     nClassifiers = len(CLASSIFIER_NAMES)
@@ -121,17 +125,29 @@ def merge_results(
         df_metrics["age"] = 0
         df_importances["age"] = 0
 
-    df_probs["model"] = np.tile(np.repeat(CLASSIFIER_NAMES, nSamples), 1)
-    df_probs["time"] = np.tile(times.flatten(), nClassifiers)
+    # Determine how many times to repeat blocks across subjects
+    rep_sub = nSubs_unique if "bysub" in classification_type else 1
 
-    df_metrics["model"] = np.tile(np.repeat(CLASSIFIER_NAMES, nSamples), 1)
-    df_metrics["time"] = np.tile(times.flatten(), nClassifiers)
+    # For probs/metrics: within each subject block we want classifier blocks where
+    # each classifier has nSamples rows (time points) in order. So for the full
+    # table we tile that pattern across subjects.
+    df_probs["model"] = np.tile(np.repeat(CLASSIFIER_NAMES, nSamples), rep_sub)
+    df_probs["time"] = np.tile(np.tile(times.flatten(), nClassifiers), rep_sub)
 
+    df_metrics["model"] = np.tile(np.repeat(CLASSIFIER_NAMES, nSamples), rep_sub)
+    df_metrics["time"] = np.tile(np.tile(times.flatten(), nClassifiers), rep_sub)
+
+    # For importances: within each subject+classifier block we want time blocks
+    # where features vary fastest (feature, then time, then subject).
     df_importances["model"] = np.tile(
-        np.repeat(CLASSIFIER_NAMES, nSamples * nFeatures), 1
+        np.repeat(CLASSIFIER_NAMES, nFeatures * nSamples), rep_sub
     )
-    df_importances["feature"] = np.tile(feature_names, nClassifiers * nSamples)
-    df_importances["time"] = np.tile(times.flatten(), nFeatures * nClassifiers)
+    df_importances["feature"] = np.tile(
+        feature_names, nClassifiers * nSamples * rep_sub
+    )
+    df_importances["time"] = np.tile(
+        np.repeat(times.flatten(), nFeatures), nClassifiers * rep_sub
+    )
 
     # Load and merge results from each classifier
     for clfIdx, clfName in enumerate(CLASSIFIER_NAMES):

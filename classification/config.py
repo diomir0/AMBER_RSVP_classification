@@ -78,16 +78,16 @@ SAMPLING_FREQ = 256  # Hz (after preprocessing, the .set files use this)
 ELEC_CLUSTS = {
     "occipital": list(range(28, 33)),  # channels 28-32
     "parietal": list(range(22, 28)),  # channels 22-27
-    "central": list(range(13, 19)),  # channels 13-18
+    "central": [11, 12, 15, 16, 17, 20, 21],  # FC1, FC2, C3, Cz, C4, CP1, CP2
     "frontal": list(range(4, 10)),  # channels 4-9
 }
 
 # ERP component windows (ms) for statistical feature extraction
 ERP_COMPONENTS = {
-    "P1": {"window_ms": (50, 150), "polarity": "positive", "cluster": "occipital"},
-    "N1": {"window_ms": (100, 200), "polarity": "negative", "cluster": "occipital"},
-    "P2": {"window_ms": (200, 325), "polarity": "positive", "cluster": "occipital"},
-    "P3": {"window_ms": (250, 500), "polarity": "positive", "cluster": "central"},
+    # "P1": {"window_ms": (50, 150), "polarity": "positive", "cluster": "occipital"},
+    # "N1": {"window_ms": (100, 200), "polarity": "negative", "cluster": "occipital"},
+    # "P2": {"window_ms": (200, 325), "polarity": "positive", "cluster": "occipital"},
+    "P3": {"window_ms": (200, 450), "polarity": "positive", "cluster": "central"},
 }
 
 # ERP statistical parameters to extract per component
